@@ -43,6 +43,12 @@ pub fn bitonic_comparator_count(n: usize) -> usize {
     network.iter().map(|stage| stage.len()).sum()
 }
 
+/// Returns the next power of 2 >= n (or n itself if already a power of 2).
+pub fn padded_size(n: usize) -> usize {
+    assert!(n >= 2, "Need at least 2 elements");
+    n.next_power_of_two()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,6 +111,62 @@ mod tests {
         assert_eq!(bitonic_comparator_count(4), 6);
         assert_eq!(bitonic_comparator_count(8), 24);
         assert_eq!(bitonic_comparator_count(16), 80);
+    }
+
+    #[test]
+    fn test_padded_size() {
+        assert_eq!(padded_size(2), 2);
+        assert_eq!(padded_size(3), 4);
+        assert_eq!(padded_size(4), 4);
+        assert_eq!(padded_size(5), 8);
+        assert_eq!(padded_size(7), 8);
+        assert_eq!(padded_size(8), 8);
+        assert_eq!(padded_size(9), 16);
+        assert_eq!(padded_size(10), 16);
+        assert_eq!(padded_size(13), 16);
+        assert_eq!(padded_size(16), 16);
+        assert_eq!(padded_size(17), 32);
+    }
+
+    #[test]
+    fn test_padded_shuffle_is_permutation() {
+        // Simulate a non-power-of-2 shuffle: 10 elements padded to 16
+        let n = 10;
+        let padded_n = padded_size(n);
+        let network = bitonic_network(padded_n);
+
+        // Real keys are random, padding keys are u64::MAX
+        let mut keys: Vec<u64> = vec![9823, 1234, 5678, 42, 99999, 7, 7777, 3141, 2718, 65535];
+        keys.resize(padded_n, u64::MAX);
+
+        let mut data: Vec<u64> = (0..n as u64).collect();
+        data.resize(padded_n, u64::MAX); // padding data
+
+        let mut key_data: Vec<(u64, u64)> = keys.into_iter().zip(data.into_iter()).collect();
+
+        for stage in &network {
+            for &(i, j, ascending) in stage {
+                let should_swap = if ascending {
+                    key_data[i].0 > key_data[j].0
+                } else {
+                    key_data[i].0 < key_data[j].0
+                };
+                if should_swap {
+                    key_data.swap(i, j);
+                }
+            }
+        }
+
+        // First n elements should be a permutation of 0..n
+        let result: Vec<u64> = key_data[..n].iter().map(|&(_, v)| v).collect();
+        let mut sorted = result.clone();
+        sorted.sort();
+        assert_eq!(sorted, (0..n as u64).collect::<Vec<u64>>());
+
+        // Last (padded_n - n) elements should be padding
+        for i in n..padded_n {
+            assert_eq!(key_data[i].1, u64::MAX);
+        }
     }
 
     #[test]

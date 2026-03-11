@@ -1,6 +1,6 @@
 # FHE Shuffle
 
-Oblivious permutation of encrypted data using [TFHE-rs](https://github.com/zama-ai/tfhe-rs). Shuffles 16 `FheUint64` ciphertexts into a uniformly random permutation — without the server ever learning the permutation applied.
+Oblivious permutation of encrypted data using [TFHE-rs](https://github.com/zama-ai/tfhe-rs). Shuffles `n` `FheUint64` ciphertexts into a uniformly random permutation — without the server ever learning the permutation applied. Supports any `n >= 2` (non-power-of-2 sizes are handled automatically via padding).
 
 ## Algorithm
 
@@ -8,10 +8,10 @@ The core idea: **reduce shuffling to sorting by random keys**. If you assign eac
 
 ### Step 1 — Generate Oblivious Random Sort Keys
 
-The server generates 16 encrypted random `FheUint64` values using TFHE's oblivious pseudo-random function (OPRF):
+The server generates `n` encrypted random `FheUint64` values using TFHE's oblivious pseudo-random function (OPRF):
 
 ```
-for i in 0..16:
+for i in 0..n:
     sort_keys[i] = FheUint64::generate_oblivious_pseudo_random(Seed(random_u128))
 ```
 
@@ -22,12 +22,23 @@ Each seed is a public random `u128`, but the OPRF evaluates a PRF under the FHE 
 Each data element gets associated with its random sort key:
 
 ```
-pairs = [(sort_keys[0], data[0]), (sort_keys[1], data[1]), ..., (sort_keys[15], data[15])]
+pairs = [(sort_keys[0], data[0]), (sort_keys[1], data[1]), ..., (sort_keys[n-1], data[n-1])]
 ```
 
 ### Step 3 — Sort via Bitonic Network
 
-We sort the 16 pairs by their encrypted keys using a **bitonic sorting network**. A bitonic network is a fixed sequence of compare-and-swap operations whose wiring is independent of the data — making it ideal for FHE where branching on encrypted values is impossible.
+We sort the `n` pairs by their encrypted keys using a **bitonic sorting network**. A bitonic network is a fixed sequence of compare-and-swap operations whose wiring is independent of the data — making it ideal for FHE where branching on encrypted values is impossible.
+
+#### Non-Power-of-2 Support
+
+The bitonic network requires a power-of-2 input size. When `n` is not a power of 2, the shuffle automatically pads to the next power of 2:
+
+- **Padding sort keys**: Trivially encrypted `u64::MAX` values. Since the bitonic network sorts in ascending order, these maximum keys are guaranteed to sort to the end of the array.
+- **Padding data**: Trivially encrypted zeros (value is irrelevant — padding is discarded after sorting).
+
+After sorting, only the first `n` positions are returned. The real elements occupy these positions (sorted by their random OPRF keys = uniform permutation), while padding sits at the end.
+
+For example, shuffling 10 elements uses a 16-element bitonic network (10 stages), with 6 padding slots. The cost is the same as shuffling 16 elements — the overhead comes from rounding up to the next power of 2.
 
 #### What is a Bitonic Network?
 
@@ -84,10 +95,10 @@ The 4 `if_then_else` operations are cheaper (one PBS per block each) and are ful
 
 ### Step 4 — Extract Shuffled Data
 
-After all 10 stages complete, the pairs are sorted by key. We discard the keys and return the data elements, which are now in a uniformly random order:
+After all stages complete, the pairs are sorted by key. We discard the keys and any padding, returning the first `n` data elements, which are now in a uniformly random order:
 
 ```
-result = [pairs[0].data, pairs[1].data, ..., pairs[15].data]
+result = [pairs[0].data, pairs[1].data, ..., pairs[n-1].data]
 ```
 
 ### Parallelism
@@ -142,15 +153,18 @@ For `n=16`:
 
 ### Scaling to Other Sizes
 
-| n | Stages | Comparators | `gt` | `if_then_else` | Collision bound |
-|---|--------|-------------|------|----------------|-----------------|
-| 4 | 3 | 6 | 6 | 24 | < 2^-61 |
-| 8 | 6 | 24 | 24 | 96 | < 2^-59 |
-| 16 | 10 | 80 | 80 | 320 | < 2^-57 |
-| 32 | 15 | 240 | 240 | 960 | < 2^-55 |
-| 64 | 21 | 672 | 672 | 2688 | < 2^-53 |
+| n | Padded to | Stages | Comparators | `gt` | `if_then_else` | Collision bound |
+|---|-----------|--------|-------------|------|----------------|-----------------|
+| 4 | 4 | 3 | 6 | 6 | 24 | < 2^-61 |
+| 8 | 8 | 6 | 24 | 24 | 96 | < 2^-59 |
+| 10 | 16 | 10 | 80 | 80 | 320 | < 2^-58 |
+| 16 | 16 | 10 | 80 | 80 | 320 | < 2^-57 |
+| 20 | 32 | 15 | 240 | 240 | 960 | < 2^-56 |
+| 32 | 32 | 15 | 240 | 240 | 960 | < 2^-55 |
+| 52 | 64 | 21 | 672 | 672 | 2688 | < 2^-54 |
+| 64 | 64 | 21 | 672 | 672 | 2688 | < 2^-53 |
 
-The collision bound degrades gracefully: even at `n=1024`, `P(collision) < 2^-44`, still well within `2^-40`.
+Non-power-of-2 sizes are padded to the next power of 2, so `n=10` has the same cost as `n=16`. The collision bound degrades gracefully: even at `n=1024`, `P(collision) < 2^-44`, still well within `2^-40`.
 
 ## Running Benchmarks
 

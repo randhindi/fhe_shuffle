@@ -8,6 +8,8 @@
 // Each comparator = 1 × gt + 4 × if_then_else.
 // Depth: O(log²n).
 //
+// Supports non-power-of-2 sizes (padded internally to next power of 2).
+//
 // Supports both CPU and GPU backends:
 //   CPU: cargo run --release
 //   GPU: cargo run --release --features gpu   (requires CUDA)
@@ -23,7 +25,7 @@ use tfhe::{prelude::*, set_server_key, ConfigBuilder, FheUint64, Seed};
 #[cfg(feature = "gpu")]
 use tfhe::CompressedServerKey;
 
-use network::{bitonic_comparator_count, bitonic_network};
+use network::{bitonic_comparator_count, bitonic_network, padded_size};
 use shuffle::bitonic_shuffle;
 
 const N: usize = 16;
@@ -42,13 +44,20 @@ fn main() {
     println!();
 
     // Print network topology
-    let network = bitonic_network(N);
-    let num_comparators = bitonic_comparator_count(N);
+    let padded_n = padded_size(N);
+    let network = bitonic_network(padded_n);
+    let num_comparators = bitonic_comparator_count(padded_n);
+    if padded_n > N {
+        println!(
+            "Input size: {} (padded to {} for bitonic network)",
+            N, padded_n
+        );
+    }
     println!(
         "Bitonic network (n={}): {} stages × {} comparators/stage = {} total comparators",
-        N,
+        padded_n,
         network.len(),
-        N / 2,
+        padded_n / 2,
         num_comparators
     );
     println!();
@@ -78,7 +87,7 @@ fn main() {
     }
     println!();
 
-    // Encrypt data values (0..15)
+    // Encrypt data values (0..N-1)
     println!("[2] Encrypting {} values...", N);
     let enc_start = Instant::now();
     let values: Vec<FheUint64> = (0..N as u64)
@@ -93,7 +102,7 @@ fn main() {
     );
     println!();
 
-    // Generate oblivious pseudo-random sort keys
+    // Generate oblivious pseudo-random sort keys (only N, not padded — shuffle pads internally)
     println!(
         "[3] Generating {} oblivious random sort keys (FheUint64)...",
         N
@@ -139,6 +148,7 @@ fn main() {
         .collect();
     let dec_time = dec_start.elapsed();
 
+    assert_eq!(decrypted.len(), N, "Expected {} results, got {}", N, decrypted.len());
     let mut sorted = decrypted.clone();
     sorted.sort();
     assert_eq!(
@@ -148,7 +158,7 @@ fn main() {
     );
     println!("  Decryption: {:?}", dec_time);
     println!("  Result: {:?}", decrypted);
-    println!("  Valid permutation confirmed");
+    println!("  Valid permutation of {} elements confirmed", N);
     println!();
 
     // Summary
@@ -159,6 +169,10 @@ fn main() {
     println!("  Backend:          GPU (CUDA)");
     #[cfg(not(feature = "gpu"))]
     println!("  Backend:          CPU");
+    println!("  Elements:         {}", N);
+    if padded_n > N {
+        println!("  Padded to:        {}", padded_n);
+    }
     println!("  OPRF generation:  {:?}", rng_time);
     println!("  Shuffle:          {:?}", shuffle_time);
     println!("  Total server-side: {:?}", rng_time + shuffle_time);

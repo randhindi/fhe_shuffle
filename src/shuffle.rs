@@ -1,7 +1,7 @@
 use rayon::prelude::*;
 use tfhe::{prelude::*, FheUint64};
 
-use crate::network::bitonic_network;
+use crate::network::{bitonic_network, padded_size};
 
 /// Uniform shuffle using a bitonic sorting network with random sort keys.
 ///
@@ -14,13 +14,19 @@ use crate::network::bitonic_network;
 /// The bitonic network for n=16 has 10 stages, each with 8 parallel comparators.
 /// Each comparator: 1 × gt + 4 × if_then_else (swap both key and data).
 ///
+/// **Non-power-of-2 support**: If n is not a power of 2, the input is internally
+/// padded to the next power of 2. Padding elements use trivially encrypted u64::MAX
+/// sort keys, which guarantees they sort to the end of the array. After sorting, only
+/// the first n elements (the real data) are returned.
+///
 /// Arguments:
-/// - `data`: encrypted values to shuffle (must be power-of-2 length)
+/// - `data`: encrypted values to shuffle (length >= 2)
 /// - `sort_keys`: encrypted random keys (one per element, same length as data)
 ///
 /// Returns: shuffled encrypted values (a uniformly random permutation of the input)
 pub fn bitonic_shuffle(data: Vec<FheUint64>, sort_keys: Vec<FheUint64>) -> Vec<FheUint64> {
     let n = data.len();
+    assert!(n >= 2, "Need at least 2 elements to shuffle");
     assert_eq!(
         sort_keys.len(),
         n,
@@ -29,10 +35,28 @@ pub fn bitonic_shuffle(data: Vec<FheUint64>, sort_keys: Vec<FheUint64>) -> Vec<F
         sort_keys.len()
     );
 
-    let network = bitonic_network(n);
+    let padded_n = padded_size(n);
+    let needs_padding = padded_n > n;
 
+    // Pad to next power of 2 if needed
     let mut data: Vec<Option<FheUint64>> = data.into_iter().map(Some).collect();
     let mut keys: Vec<Option<FheUint64>> = sort_keys.into_iter().map(Some).collect();
+
+    if needs_padding {
+        let pad_count = padded_n - n;
+        println!(
+            "  Padding {} elements to {} (next power of 2, +{} padding)",
+            n, padded_n, pad_count
+        );
+        for _ in 0..pad_count {
+            // Trivially encrypted u64::MAX keys sort to the end
+            keys.push(Some(FheUint64::encrypt_trivial(u64::MAX)));
+            // Padding data — value doesn't matter, will be discarded
+            data.push(Some(FheUint64::encrypt_trivial(0u64)));
+        }
+    }
+
+    let network = bitonic_network(padded_n);
 
     for (stage_num, stage) in network.iter().enumerate() {
         let stage_start = std::time::Instant::now();
@@ -87,5 +111,9 @@ pub fn bitonic_shuffle(data: Vec<FheUint64>, sort_keys: Vec<FheUint64>) -> Vec<F
         );
     }
 
-    data.into_iter().map(|x| x.unwrap()).collect()
+    // Return only the first n elements (discard padding)
+    data.into_iter()
+        .take(n)
+        .map(|x| x.unwrap())
+        .collect()
 }
