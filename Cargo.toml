@@ -1,0 +1,17 @@
+[package]
+name = "fhe_shuffle"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+gpu = ["tfhe/gpu"]
+
+[dependencies]
+tfhe = { version = "1.5.3", features = ["integer", "boolean", "shortint"], default-features = false }
+rayon = "1.10"
+rand = "0.8"
+
+[profile.release]
+lto = true
+codegen-units = 1

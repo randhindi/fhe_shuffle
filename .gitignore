@@ -1,0 +1,18 @@
+# Cargo build artifacts
+/target/
+
+# Rustfmt backup files
+**/*.rs.bk
+
+# Debug symbols (MSVC on Windows)
+*.pdb
+
+# macOS
+.DS_Store
+
+# Node / JS tooling (if present)
+node_modules/
+
+# IDEs
+.idea/
+.vscode/
