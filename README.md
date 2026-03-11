@@ -2,38 +2,111 @@
 
 Oblivious permutation of encrypted data using [TFHE-rs](https://github.com/zama-ai/tfhe-rs). Shuffles 16 `FheUint64` ciphertexts into a uniformly random permutation — without the server ever learning the permutation applied.
 
-## How It Works
+## Algorithm
 
-The shuffle uses a **bitonic sorting network** with **oblivious pseudo-random sort keys**:
+The core idea: **reduce shuffling to sorting by random keys**. If you assign each element a uniformly random sort key and sort the (key, element) pairs, the resulting order of elements is a uniformly random permutation (provided all keys are distinct). We implement this entirely in FHE using a bitonic sorting network.
 
-1. **Generate random keys**: The server generates 16 encrypted random `FheUint64` values using TFHE's oblivious pseudo-random function (OPRF). Each value is encrypted — nobody (not even the server) knows the plaintext keys until the client decrypts.
+### Step 1 — Generate Oblivious Random Sort Keys
 
-2. **Sort by random keys**: The 16 (key, data) pairs are sorted using a fixed bitonic sorting network. The network topology is data-independent: the same sequence of compare-and-swap operations runs regardless of the encrypted values, making the entire computation oblivious.
+The server generates 16 encrypted random `FheUint64` values using TFHE's oblivious pseudo-random function (OPRF):
 
-3. **Output**: After sorting, the data elements are in a uniformly random order determined by the random keys.
+```
+for i in 0..16:
+    sort_keys[i] = FheUint64::generate_oblivious_pseudo_random(Seed(random_u128))
+```
 
-### Bitonic Sorting Network
+Each seed is a public random `u128`, but the OPRF evaluates a PRF under the FHE secret key — the resulting ciphertext encrypts a pseudorandom 64-bit value that **nobody knows** (not the server, not the client) until the client decrypts. This is what makes the shuffle oblivious: the server cannot learn which permutation was applied.
 
-A bitonic network for `n = 2^k` elements has `k(k+1)/2` stages, each containing `n/2` independent comparators:
+### Step 2 — Pair Keys with Data
 
-| n | Stages | Comparators/stage | Total comparators |
-|---|--------|-------------------|-------------------|
-| 2 | 1 | 1 | 1 |
-| 4 | 3 | 2 | 6 |
-| 8 | 6 | 4 | 24 |
-| 16 | 10 | 8 | 80 |
+Each data element gets associated with its random sort key:
 
-Each comparator performs:
-- 1 × `gt` (or `lt`) — compare the two sort keys
-- 4 × `if_then_else` — conditionally swap both the key and the data element
+```
+pairs = [(sort_keys[0], data[0]), (sort_keys[1], data[1]), ..., (sort_keys[15], data[15])]
+```
 
-All 8 comparators within a stage are independent and run in parallel via [rayon](https://github.com/rayon-rs/rayon). The 4 `if_then_else` calls within each comparator also run in parallel using nested `rayon::join`.
+### Step 3 — Sort via Bitonic Network
+
+We sort the 16 pairs by their encrypted keys using a **bitonic sorting network**. A bitonic network is a fixed sequence of compare-and-swap operations whose wiring is independent of the data — making it ideal for FHE where branching on encrypted values is impossible.
+
+#### What is a Bitonic Network?
+
+A bitonic sorting network sorts by recursively building **bitonic sequences** (sequences that first increase then decrease, or vice versa) and then merging them. For `n = 2^k` elements, the network consists of `k(k+1)/2` stages, each containing `n/2` independent comparators.
+
+For `n = 16` (`k = 4`): **10 stages**, each with **8 comparators** = **80 comparators** total.
+
+The network is organized into 4 phases:
+
+```
+Phase 0 (k=1): 1 stage   — sorts pairs of 2 into bitonic sequences of 4
+Phase 1 (k=2): 2 stages  — merges into bitonic sequences of 8
+Phase 2 (k=3): 3 stages  — merges into bitonic sequences of 16
+Phase 3 (k=4): 4 stages  — final merge, produces fully sorted output
+                           ──────
+                           10 stages total
+```
+
+Each stage consists of 8 comparators that operate on disjoint pairs. The pair indices are determined by XOR masks — in stage `(phase, step)`, element `i` is compared with element `j = i XOR (1 << step)`:
+
+```
+Stage  1: (0,1) (2,3) (4,5) (6,7) (8,9) (10,11) (12,13) (14,15)   step=1
+Stage  2: (0,2) (1,3) (4,6) (5,7) (8,10) (9,11) (12,14) (13,15)   step=2
+Stage  3: (0,1) (2,3) (4,5) (6,7) (8,9) (10,11) (12,13) (14,15)   step=1
+Stage  4: (0,4) (1,5) (2,6) (3,7) (8,12) (9,13) (10,14) (11,15)   step=4
+Stage  5: (0,2) (1,3) (4,6) (5,7) (8,10) (9,11) (12,14) (13,15)   step=2
+Stage  6: (0,1) (2,3) (4,5) (6,7) (8,9) (10,11) (12,13) (14,15)   step=1
+Stage  7: (0,8) (1,9) (2,10) (3,11) (4,12) (5,13) (6,14) (7,15)   step=8
+Stage  8: (0,4) (1,5) (2,6) (3,7) (8,12) (9,13) (10,14) (11,15)   step=4
+Stage  9: (0,2) (1,3) (4,6) (5,7) (8,10) (9,11) (12,14) (13,15)   step=2
+Stage 10: (0,1) (2,3) (4,5) (6,7) (8,9) (10,11) (12,13) (14,15)   step=1
+```
+
+Each comparator also has a **direction** (ascending or descending) determined by `(i >> (phase + 1)) & 1`. This alternating direction is what creates the bitonic merge structure.
+
+#### What Each Comparator Does (in FHE)
+
+Each comparator takes two (key, data) pairs at positions `i` and `j` and conditionally swaps them. In plaintext this would be a simple `if key[i] > key[j] then swap`, but in FHE we cannot branch on encrypted values. Instead:
+
+```
+// 1. Compare the encrypted keys (produces an encrypted boolean)
+cmp = key[i].gt(&key[j])       // or .lt() depending on direction
+
+// 2. Conditional swap — all 4 if_then_else run in parallel:
+new_key[i] = cmp.if_then_else(key[j], key[i])     // if cmp: take j's key, else keep i's
+new_key[j] = cmp.if_then_else(key[i], key[j])     // if cmp: take i's key, else keep j's
+new_data[i] = cmp.if_then_else(data[j], data[i])   // if cmp: take j's data, else keep i's
+new_data[j] = cmp.if_then_else(data[i], data[j])   // if cmp: take i's data, else keep j's
+```
+
+The `gt` comparison is the most expensive operation. Each `FheUint64` consists of 32 blocks of 2 encrypted bits each, and comparing two values requires a chain of programmable bootstrapping (PBS) operations across all 32 blocks.
+
+The 4 `if_then_else` operations are cheaper (one PBS per block each) and are fully independent, so they run in parallel via nested `rayon::join`.
+
+### Step 4 — Extract Shuffled Data
+
+After all 10 stages complete, the pairs are sorted by key. We discard the keys and return the data elements, which are now in a uniformly random order:
+
+```
+result = [pairs[0].data, pairs[1].data, ..., pairs[15].data]
+```
+
+### Parallelism
+
+The algorithm maximizes parallelism at two levels:
+
+1. **Inter-comparator** (stage-level): All 8 comparators in each stage operate on disjoint pairs and execute in parallel via `rayon::par_iter()`.
+
+2. **Intra-comparator**: Within each comparator, the 4 `if_then_else` calls are independent and run concurrently via nested `rayon::join()` (2 keys + 2 data values, structured as two pairs of two).
+
+The overall depth is **10 sequential stages**. The width is **8 parallel comparators × 4 parallel if_then_else = 32-way parallelism** within each stage (plus the `gt` comparison which must complete first).
 
 ### Why Not Benes Network?
 
-A Benes permutation network has optimal depth (`2k-1 = 7` stages for `n=16`) but **cannot produce uniform permutations from random control bits**. The issue: `2^56` random bit patterns map non-uniformly onto `16! ≈ 2^44.25` permutations. Some permutations are reached by more bit patterns than others, creating measurable bias.
+A Benes permutation network has optimal depth (`2k-1 = 7` stages for `n=16`) and only needs binary control bits (swap or don't swap), making each comparator cheaper (2 × `if_then_else`, no `gt`). However, it **cannot produce uniform permutations from random control bits**.
 
-The bitonic sort approach avoids this entirely — any distinct set of sort keys maps to exactly one permutation.
+The problem: a Benes network for `n=16` has 56 control bits, giving `2^56` possible configurations. These map onto `16! ≈ 2^44.25` permutations. Since `2^56` does not divide `16!`, the mapping is necessarily non-uniform — some permutations are reached by more bit patterns than others.
+
+The bitonic sort approach avoids this entirely. With distinct sort keys, each of the `16!` possible orderings of keys maps to exactly one permutation. The only source of non-uniformity is key collisions, which occur with negligible probability.
 
 ## Uniformity Analysis
 
@@ -42,15 +115,19 @@ The shuffle is a **uniformly random permutation** conditioned on all 16 sort key
 **Collision probability** (birthday bound):
 
 ```
-P(collision) = C(16, 2) / 2^64 = 120 / 2^64 ≈ 6.5 × 10^-18 < 2^-57
+P(at least one collision) = 1 - Product(i=0..15) of (2^64 - i) / 2^64
+                          ≤ C(16, 2) / 2^64
+                          = 120 / 2^64
+                          ≈ 6.5 × 10^-18
+                          < 2^-57
 ```
 
 This means:
 - **Statistical distance from uniform**: `< 2^-57`
-- **Bias**: for any specific permutation π, `|Pr[output = π] - 1/16!| < 2^-57 / 16!`
+- **Bias per permutation**: for any specific permutation π, `|Pr[output = π] - 1/16!| < 2^-57 / 16!`
 - This is well within the `< 2^-40` security bound
 
-In practice, you would need to run the shuffle roughly `2^57` times before observing a single key collision (and even then, the output is still a valid permutation — just not drawn from the perfectly uniform distribution).
+In practice, you would need to run the shuffle roughly `2^57` times before expecting a single key collision. Even in the (astronomically unlikely) event of a collision, the output is still a valid permutation of the input — just not drawn from the perfectly uniform distribution.
 
 ### FHE Operations Per Shuffle
 
@@ -63,6 +140,18 @@ For `n=16`:
 | `if_then_else` | 320 | 80 comparators × 4 each |
 | **Total PBS** | **~12,800** | Each `FheUint64` = 32 blocks of 2 bits |
 
+### Scaling to Other Sizes
+
+| n | Stages | Comparators | `gt` | `if_then_else` | Collision bound |
+|---|--------|-------------|------|----------------|-----------------|
+| 4 | 3 | 6 | 6 | 24 | < 2^-61 |
+| 8 | 6 | 24 | 24 | 96 | < 2^-59 |
+| 16 | 10 | 80 | 80 | 320 | < 2^-57 |
+| 32 | 15 | 240 | 240 | 960 | < 2^-55 |
+| 64 | 21 | 672 | 672 | 2688 | < 2^-53 |
+
+The collision bound degrades gracefully: even at `n=1024`, `P(collision) < 2^-44`, still well within `2^-40`.
+
 ## Running Benchmarks
 
 ### Prerequisites
@@ -73,7 +162,6 @@ For `n=16`:
 ### CPU
 
 ```bash
-cd fhe_shuffle
 source environment/dev.env
 cargo run --release
 ```
@@ -81,7 +169,6 @@ cargo run --release
 ### GPU (CUDA)
 
 ```bash
-cd fhe_shuffle
 source environment/dev.env
 cargo run --release --features gpu
 ```
@@ -89,7 +176,6 @@ cargo run --release --features gpu
 ### Tests
 
 ```bash
-cd fhe_shuffle
 source environment/dev.env
 cargo test --release
 ```
