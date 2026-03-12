@@ -1,48 +1,36 @@
-// FHE Shuffle — Uniformly random oblivious permutation using TFHE-rs
+// FHE Shuffle Benchmark
 //
-// Uses a bitonic sorting network with server-generated oblivious pseudo-random sort keys.
-// Each element gets a random FheUint64 key; sorting by these keys produces a uniform
-// random permutation (statistical distance < 2^-57 from uniform for n=16).
+// Benchmarks oblivious_shuffle for n = 8, 16, 32 elements.
 //
-// Supports non-power-of-2 sizes (padded internally to next power of 2).
-//
-// Supports both CPU and GPU backends:
-//   CPU: cargo run --release
-//   GPU: cargo run --release --features gpu   (requires CUDA)
-
-mod network;
-mod shuffle;
+// CPU:  cargo run --release
+// GPU:  cargo run --release --features gpu
 
 use std::time::{Duration, Instant};
 
-use rand::Rng;
-use tfhe::{prelude::*, set_server_key, ConfigBuilder, ClientKey, FheUint64, Seed};
+use tfhe::{prelude::*, set_server_key, ConfigBuilder, ClientKey, FheUint64};
 
 #[cfg(feature = "gpu")]
 use tfhe::CompressedServerKey;
 
-use network::{bitonic_comparator_count, bitonic_network, padded_size};
-use shuffle::bitonic_shuffle;
+use fhe_shuffle::network::{bitonic_comparator_count, bitonic_network, padded_size};
+use fhe_shuffle::oblivious_shuffle;
 
 const SIZES: &[usize] = &[8, 16, 32];
+const KEY_PRECISION: u32 = 64;
 
 struct BenchResult {
     n: usize,
     padded_n: usize,
     stages: usize,
     comparators: usize,
-    oprf_time: Duration,
     shuffle_time: Duration,
-    total_time: Duration,
 }
 
 fn bench_shuffle(n: usize, client_key: &ClientKey) -> BenchResult {
     let padded_n = padded_size(n);
     let network = bitonic_network(padded_n);
-    let num_comparators = bitonic_comparator_count(padded_n);
-    let num_stages = network.len();
 
-    println!("--- n={} (padded to {}, {} stages) ---", n, padded_n, num_stages);
+    println!("--- n={} (padded to {}, {} stages) ---", n, padded_n, network.len());
 
     // Encrypt data values
     let enc_start = Instant::now();
@@ -51,53 +39,27 @@ fn bench_shuffle(n: usize, client_key: &ClientKey) -> BenchResult {
         .collect();
     println!("  Encrypt: {:?}", enc_start.elapsed());
 
-    // Generate oblivious pseudo-random sort keys
-    let mut rng = rand::thread_rng();
-    let rng_start = Instant::now();
-    let sort_keys: Vec<FheUint64> = (0..n)
-        .map(|_| FheUint64::generate_oblivious_pseudo_random(Seed(rng.gen::<u128>())))
-        .collect();
-    let oprf_time = rng_start.elapsed();
-    println!("  OPRF:    {:?}", oprf_time);
-
-    // Run the bitonic shuffle
+    // Run oblivious shuffle (OPRF + sort happen inside)
     let shuffle_start = Instant::now();
-    let result = bitonic_shuffle(values, sort_keys);
+    let result = oblivious_shuffle(values, KEY_PRECISION);
     let shuffle_time = shuffle_start.elapsed();
     println!("  Shuffle: {:?}", shuffle_time);
 
     // Decrypt and verify
-    let decrypted: Vec<u64> = result
-        .iter()
-        .map(|v| {
-            let val: u64 = v.decrypt(client_key);
-            val
-        })
-        .collect();
-
+    let decrypted: Vec<u64> = result.iter().map(|v| v.decrypt(client_key)).collect();
     assert_eq!(decrypted.len(), n);
     let mut sorted = decrypted.clone();
     sorted.sort();
-    assert_eq!(
-        sorted,
-        (0..n as u64).collect::<Vec<u64>>(),
-        "n={}: Not a valid permutation!",
-        n
-    );
+    assert_eq!(sorted, (0..n as u64).collect::<Vec<u64>>(), "Not a valid permutation!");
     println!("  Verified: valid permutation");
-
-    let total_time = oprf_time + shuffle_time;
-    println!("  Total:   {:?}", total_time);
     println!();
 
     BenchResult {
         n,
         padded_n,
-        stages: num_stages,
-        comparators: num_comparators,
-        oprf_time,
+        stages: network.len(),
+        comparators: bitonic_comparator_count(padded_n),
         shuffle_time,
-        total_time,
     }
 }
 
@@ -113,11 +75,12 @@ fn format_duration(d: Duration) -> String {
 }
 
 fn main() {
-    println!("=== FHE Shuffle Benchmark Suite ===");
+    println!("=== FHE Shuffle Benchmark ===");
     #[cfg(feature = "gpu")]
     println!("Backend: GPU (CUDA)");
     #[cfg(not(feature = "gpu"))]
     println!("Backend: CPU");
+    println!("Key precision: {} bits", KEY_PRECISION);
     println!("Sizes: {:?}", SIZES);
     println!();
 
@@ -128,7 +91,6 @@ fn main() {
     let (client_key, server_key) = tfhe::generate_keys(config);
     println!("  Key generation: {:?}", keygen_start.elapsed());
 
-    // Set up backend (CPU or GPU)
     #[cfg(not(feature = "gpu"))]
     {
         set_server_key(server_key.clone());
@@ -163,26 +125,25 @@ fn main() {
     println!("Backend: GPU (CUDA)");
     #[cfg(not(feature = "gpu"))]
     println!("Backend: CPU");
+    println!("Key precision: {} bits", KEY_PRECISION);
     println!();
     println!(
-        "{:>6} {:>8} {:>8} {:>6} {:>12} {:>12} {:>12} {:>12}",
-        "n", "padded", "stages", "comps", "OPRF", "Shuffle", "Total", "/element"
+        "{:>6} {:>8} {:>8} {:>6} {:>12} {:>12}",
+        "n", "padded", "stages", "comps", "Total", "/element"
     );
-    println!("{}", "-".repeat(82));
+    println!("{}", "-".repeat(58));
 
     for r in &results {
-        let per_element = r.total_time / r.n as u32;
+        let per_element = r.shuffle_time / r.n as u32;
         println!(
-            "{:>6} {:>8} {:>8} {:>6} {:>12} {:>12} {:>12} {:>12}",
+            "{:>6} {:>8} {:>8} {:>6} {:>12} {:>12}",
             r.n,
             r.padded_n,
             r.stages,
             r.comparators,
-            format_duration(r.oprf_time),
             format_duration(r.shuffle_time),
-            format_duration(r.total_time),
             format_duration(per_element),
         );
     }
-    println!("{}", "-".repeat(82));
+    println!("{}", "-".repeat(58));
 }

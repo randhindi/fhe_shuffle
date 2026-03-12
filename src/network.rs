@@ -224,4 +224,117 @@ mod tests {
         sorted.sort();
         assert_eq!(sorted, (0..16).collect::<Vec<u64>>());
     }
+
+    /// Helper: run a plaintext bitonic sort on the given data.
+    fn plaintext_bitonic_sort(data: &mut [u64]) {
+        let n = data.len();
+        let network = bitonic_network(n);
+        for stage in &network {
+            for &(i, j, ascending) in stage {
+                let should_swap = if ascending {
+                    data[i] > data[j]
+                } else {
+                    data[i] < data[j]
+                };
+                if should_swap {
+                    data.swap(i, j);
+                }
+            }
+        }
+    }
+
+    /// Helper: simulate shuffle by sorting (key, data) pairs.
+    fn plaintext_shuffle(data: &mut [u64], keys: &[u64]) {
+        let n = data.len();
+        assert_eq!(keys.len(), n);
+        let network = bitonic_network(n);
+        let mut kd: Vec<(u64, u64)> = keys.iter().copied().zip(data.iter().copied()).collect();
+        for stage in &network {
+            for &(i, j, ascending) in stage {
+                let swap = if ascending { kd[i].0 > kd[j].0 } else { kd[i].0 < kd[j].0 };
+                if swap { kd.swap(i, j); }
+            }
+        }
+        for (i, &(_, v)) in kd.iter().enumerate() {
+            data[i] = v;
+        }
+    }
+
+    #[test]
+    fn test_bitonic_sorts_8_elements() {
+        let mut data: Vec<u64> = vec![7, 2, 5, 0, 3, 6, 1, 4];
+        plaintext_bitonic_sort(&mut data);
+        assert_eq!(data, (0..8).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn test_bitonic_sorts_32_elements() {
+        let mut data: Vec<u64> = (0..32).rev().collect();
+        plaintext_bitonic_sort(&mut data);
+        assert_eq!(data, (0..32).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn test_bitonic_sorts_already_sorted() {
+        let mut data: Vec<u64> = (0..16).collect();
+        plaintext_bitonic_sort(&mut data);
+        assert_eq!(data, (0..16).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn test_bitonic_sorts_all_equal() {
+        let mut data: Vec<u64> = vec![42; 8];
+        plaintext_bitonic_sort(&mut data);
+        assert_eq!(data, vec![42; 8]);
+    }
+
+    #[test]
+    fn test_all_permutations_reachable_n4() {
+        // For n=4, there are 4! = 24 permutations. Verify that all 24 are
+        // reachable by sorting with distinct keys.
+        use std::collections::HashSet;
+
+        let mut seen = HashSet::new();
+
+        // Try all 24 orderings of 4 distinct keys
+        let base_keys: Vec<u64> = vec![10, 20, 30, 40];
+        let perms: Vec<Vec<usize>> = vec![
+            vec![0,1,2,3], vec![0,1,3,2], vec![0,2,1,3], vec![0,2,3,1],
+            vec![0,3,1,2], vec![0,3,2,1], vec![1,0,2,3], vec![1,0,3,2],
+            vec![1,2,0,3], vec![1,2,3,0], vec![1,3,0,2], vec![1,3,2,0],
+            vec![2,0,1,3], vec![2,0,3,1], vec![2,1,0,3], vec![2,1,3,0],
+            vec![2,3,0,1], vec![2,3,1,0], vec![3,0,1,2], vec![3,0,2,1],
+            vec![3,1,0,2], vec![3,1,2,0], vec![3,2,0,1], vec![3,2,1,0],
+        ];
+
+        for perm in &perms {
+            let keys: Vec<u64> = perm.iter().map(|&i| base_keys[i]).collect();
+            let mut data: Vec<u64> = vec![0, 1, 2, 3];
+            plaintext_shuffle(&mut data, &keys);
+            seen.insert(data);
+        }
+
+        assert_eq!(seen.len(), 24, "Not all 24 permutations were produced");
+    }
+
+    #[test]
+    fn test_shuffle_8_elements_is_permutation() {
+        let keys: Vec<u64> = vec![800, 100, 500, 300, 700, 200, 600, 400];
+        let mut data: Vec<u64> = (0..8).collect();
+        plaintext_shuffle(&mut data, &keys);
+        let mut sorted = data.clone();
+        sorted.sort();
+        assert_eq!(sorted, (0..8).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn test_shuffle_32_elements_is_permutation() {
+        // Use reversed indices as keys to get a deterministic but non-trivial permutation
+        let keys: Vec<u64> = (0..32).rev().collect();
+        let mut data: Vec<u64> = (0..32).collect();
+        plaintext_shuffle(&mut data, &keys);
+        let mut sorted = data.clone();
+        sorted.sort();
+        assert_eq!(sorted, (0..32).collect::<Vec<u64>>());
+    }
 }
