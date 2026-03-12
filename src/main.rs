@@ -24,7 +24,7 @@ use tfhe::CompressedServerKey;
 use network::{bitonic_comparator_count, bitonic_network, padded_size};
 use shuffle::bitonic_shuffle;
 
-const SIZES: &[usize] = &[8, 16, 32, 64, 128, 256, 512, 1024];
+const SIZES: &[usize] = &[8, 16, 32];
 
 struct BenchResult {
     n: usize,

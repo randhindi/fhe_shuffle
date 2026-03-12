@@ -82,16 +82,14 @@ Each comparator takes two (key, data) pairs at positions `i` and `j` and conditi
 // 1. Compare the encrypted keys (produces an encrypted boolean)
 cmp = key[i].gt(&key[j])       // or .lt() depending on direction
 
-// 2. Conditional swap — all 4 if_then_else run in parallel:
-new_key[i] = cmp.if_then_else(key[j], key[i])     // if cmp: take j's key, else keep i's
-new_key[j] = cmp.if_then_else(key[i], key[j])     // if cmp: take i's key, else keep j's
-new_data[i] = cmp.if_then_else(data[j], data[i])   // if cmp: take j's data, else keep i's
-new_data[j] = cmp.if_then_else(data[i], data[j])   // if cmp: take i's data, else keep j's
+// 2. Conditional swap using flip — both flips run in parallel:
+(new_key[i], new_key[j]) = cmp.flip(key[i], key[j])    // swap keys if cmp is true
+(new_data[i], new_data[j]) = cmp.flip(data[i], data[j])  // swap data if cmp is true
 ```
 
 The `gt` comparison is the most expensive operation. Each `FheUint64` consists of 32 blocks of 2 encrypted bits each, and comparing two values requires a chain of programmable bootstrapping (PBS) operations across all 32 blocks.
 
-The 4 `if_then_else` operations are cheaper (one PBS per block each) and are fully independent, so they run in parallel via nested `rayon::join`.
+The `flip` operator (introduced in TFHE-rs v1.4.1) performs a conditional swap of two encrypted values in a single operation: `flip(true, a, b) = (b, a)` and `flip(false, a, b) = (a, b)`. The two `flip` calls (keys and data) are independent and run in parallel via `rayon::join`.
 
 ### Step 4 — Extract Shuffled Data
 
@@ -107,9 +105,9 @@ The algorithm maximizes parallelism at two levels:
 
 1. **Inter-comparator** (stage-level): All 8 comparators in each stage operate on disjoint pairs and execute in parallel via `rayon::par_iter()`.
 
-2. **Intra-comparator**: Within each comparator, the 4 `if_then_else` calls are independent and run concurrently via nested `rayon::join()` (2 keys + 2 data values, structured as two pairs of two).
+2. **Intra-comparator**: Within each comparator, the 2 `flip` calls (keys and data) are independent and run concurrently via `rayon::join()`.
 
-The overall depth is **10 sequential stages**. The width is **8 parallel comparators × 4 parallel if_then_else = 32-way parallelism** within each stage (plus the `gt` comparison which must complete first).
+The overall depth is **10 sequential stages**. The width is **8 parallel comparators × 2 parallel flips = 16-way parallelism** within each stage (plus the `gt` comparison which must complete first).
 
 ### Why Not Benes Network?
 
@@ -148,21 +146,20 @@ For `n=16`:
 |-----------|-------|-------|
 | OPRF (key generation) | 16 | One `FheUint64` per element |
 | `gt` / `lt` comparisons | 80 | 10 stages × 8 comparators |
-| `if_then_else` | 320 | 80 comparators × 4 each |
-| **Total PBS** | **~12,800** | Each `FheUint64` = 32 blocks of 2 bits |
+| `flip` (conditional swap) | 160 | 80 comparators × 2 each (keys + data) |
 
 ### Scaling to Other Sizes
 
-| n | Padded to | Stages | Comparators | `gt` | `if_then_else` | Collision bound |
-|---|-----------|--------|-------------|------|----------------|-----------------|
-| 4 | 4 | 3 | 6 | 6 | 24 | < 2^-61 |
-| 8 | 8 | 6 | 24 | 24 | 96 | < 2^-59 |
-| 10 | 16 | 10 | 80 | 80 | 320 | < 2^-58 |
-| 16 | 16 | 10 | 80 | 80 | 320 | < 2^-57 |
-| 20 | 32 | 15 | 240 | 240 | 960 | < 2^-56 |
-| 32 | 32 | 15 | 240 | 240 | 960 | < 2^-55 |
-| 52 | 64 | 21 | 672 | 672 | 2688 | < 2^-54 |
-| 64 | 64 | 21 | 672 | 672 | 2688 | < 2^-53 |
+| n | Padded to | Stages | Comparators | `gt` | `flip` | Collision bound |
+|---|-----------|--------|-------------|------|--------|-----------------|
+| 4 | 4 | 3 | 6 | 6 | 12 | < 2^-61 |
+| 8 | 8 | 6 | 24 | 24 | 48 | < 2^-59 |
+| 10 | 16 | 10 | 80 | 80 | 160 | < 2^-58 |
+| 16 | 16 | 10 | 80 | 80 | 160 | < 2^-57 |
+| 20 | 32 | 15 | 240 | 240 | 480 | < 2^-56 |
+| 32 | 32 | 15 | 240 | 240 | 480 | < 2^-55 |
+| 52 | 64 | 21 | 672 | 672 | 1344 | < 2^-54 |
+| 64 | 64 | 21 | 672 | 672 | 1344 | < 2^-53 |
 
 Non-power-of-2 sizes are padded to the next power of 2, so `n=10` has the same cost as `n=16`. The collision bound degrades gracefully: even at `n=1024`, `P(collision) < 2^-44`, still well within `2^-40`.
 
@@ -214,6 +211,6 @@ fhe_shuffle/
 
 | Crate | Version | Purpose |
 |-------|---------|---------|
-| `tfhe` | 1.5.3 | FHE operations (`FheUint64`, OPRF, `if_then_else`, `gt`) |
+| `tfhe` | 1.5.3 | FHE operations (`FheUint64`, OPRF, `flip`, `gt`) |
 | `rayon` | 1.10 | Parallel comparators within each stage |
 | `rand` | 0.8 | Seeds for OPRF generation |

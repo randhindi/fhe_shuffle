@@ -12,7 +12,7 @@ use crate::network::{bitonic_network, padded_size};
 /// Collision probability: C(n,2)/2^64 < 2^-57 for n=16, well within < 2^-40.
 ///
 /// The bitonic network for n=16 has 10 stages, each with 8 parallel comparators.
-/// Each comparator: 1 × gt + 4 × if_then_else (swap both key and data).
+/// Each comparator: 1 × gt + 2 × flip (conditional swap of both key and data).
 ///
 /// **Non-power-of-2 support**: If n is not a power of 2, the input is internally
 /// padded to the next power of 2. Padding elements use trivially encrypted u64::MAX
@@ -87,9 +87,10 @@ pub fn bitonic_shuffle(data: Vec<FheUint64>, sort_keys: Vec<FheUint64>) -> Vec<F
                 };
 
                 // Conditional swap both keys and data in parallel
+                // flip(true, a, b) = (b, a); flip(false, a, b) = (a, b)
                 let ((new_ki, new_kj), (new_di, new_dj)) = rayon::join(
-                    || rayon::join(|| cmp.if_then_else(&kj, &ki), || cmp.if_then_else(&ki, &kj)),
-                    || rayon::join(|| cmp.if_then_else(&dj, &di), || cmp.if_then_else(&di, &dj)),
+                    || cmp.flip(&ki, &kj),
+                    || cmp.flip(&di, &dj),
                 );
 
                 (i, j, new_ki, new_kj, new_di, new_dj)
