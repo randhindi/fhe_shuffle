@@ -1,6 +1,6 @@
 // FHE Shuffle Benchmark
 //
-// Benchmarks oblivious_shuffle for n = 8, 16, 32 elements.
+// Benchmarks oblivious_shuffle for various N and key precisions.
 //
 // CPU:  cargo run --release
 // GPU:  cargo run --release --features gpu
@@ -15,22 +15,29 @@ use tfhe::CompressedServerKey;
 use fhe_shuffle::network::{bitonic_comparator_count, bitonic_network, padded_size};
 use fhe_shuffle::oblivious_shuffle;
 
-const SIZES: &[usize] = &[8, 16, 32];
-const KEY_PRECISION: u32 = 64;
+const SIZES: &[usize] = &[8, 16];
+const KEY_PRECISIONS: &[u32] = &[16, 32];
 
 struct BenchResult {
     n: usize,
+    key_bits: u32,
     padded_n: usize,
     stages: usize,
     comparators: usize,
     shuffle_time: Duration,
 }
 
-fn bench_shuffle(n: usize, client_key: &ClientKey) -> BenchResult {
+fn bench_shuffle(n: usize, key_bits: u32, client_key: &ClientKey) -> BenchResult {
     let padded_n = padded_size(n);
     let network = bitonic_network(padded_n);
 
-    println!("--- n={} (padded to {}, {} stages) ---", n, padded_n, network.len());
+    println!(
+        "--- n={}, {}-bit keys (padded to {}, {} stages) ---",
+        n,
+        key_bits,
+        padded_n,
+        network.len()
+    );
 
     // Encrypt data values
     let enc_start = Instant::now();
@@ -39,9 +46,9 @@ fn bench_shuffle(n: usize, client_key: &ClientKey) -> BenchResult {
         .collect();
     println!("  Encrypt: {:?}", enc_start.elapsed());
 
-    // Run oblivious shuffle (OPRF + sort happen inside)
+    // Run oblivious shuffle
     let shuffle_start = Instant::now();
-    let result = oblivious_shuffle(values, KEY_PRECISION);
+    let result = oblivious_shuffle(values, key_bits);
     let shuffle_time = shuffle_start.elapsed();
     println!("  Shuffle: {:?}", shuffle_time);
 
@@ -50,12 +57,17 @@ fn bench_shuffle(n: usize, client_key: &ClientKey) -> BenchResult {
     assert_eq!(decrypted.len(), n);
     let mut sorted = decrypted.clone();
     sorted.sort();
-    assert_eq!(sorted, (0..n as u64).collect::<Vec<u64>>(), "Not a valid permutation!");
+    assert_eq!(
+        sorted,
+        (0..n as u64).collect::<Vec<u64>>(),
+        "Not a valid permutation!"
+    );
     println!("  Verified: valid permutation");
     println!();
 
     BenchResult {
         n,
+        key_bits,
         padded_n,
         stages: network.len(),
         comparators: bitonic_comparator_count(padded_n),
@@ -80,7 +92,7 @@ fn main() {
     println!("Backend: GPU (CUDA)");
     #[cfg(not(feature = "gpu"))]
     println!("Backend: CPU");
-    println!("Key precision: {} bits", KEY_PRECISION);
+    println!("Key precisions: {:?} bits", KEY_PRECISIONS);
     println!("Sizes: {:?}", SIZES);
     println!();
 
@@ -108,14 +120,17 @@ fn main() {
     }
     println!();
 
-    // Run benchmarks
+    // Run benchmarks: each key precision, then each size
     println!("[2] Running benchmarks...");
     println!();
 
-    let results: Vec<BenchResult> = SIZES
-        .iter()
-        .map(|&n| bench_shuffle(n, &client_key))
-        .collect();
+    let mut results: Vec<BenchResult> = Vec::new();
+
+    for &key_bits in KEY_PRECISIONS {
+        for &n in SIZES {
+            results.push(bench_shuffle(n, key_bits, &client_key));
+        }
+    }
 
     // Print results table
     println!("========================================================================");
@@ -125,25 +140,29 @@ fn main() {
     println!("Backend: GPU (CUDA)");
     #[cfg(not(feature = "gpu"))]
     println!("Backend: CPU");
-    println!("Key precision: {} bits", KEY_PRECISION);
     println!();
-    println!(
-        "{:>6} {:>8} {:>8} {:>6} {:>12} {:>12}",
-        "n", "padded", "stages", "comps", "Total", "/element"
-    );
-    println!("{}", "-".repeat(58));
 
-    for r in &results {
-        let per_element = r.shuffle_time / r.n as u32;
+    for &key_bits in KEY_PRECISIONS {
+        println!("--- {}-bit sort keys ---", key_bits);
         println!(
             "{:>6} {:>8} {:>8} {:>6} {:>12} {:>12}",
-            r.n,
-            r.padded_n,
-            r.stages,
-            r.comparators,
-            format_duration(r.shuffle_time),
-            format_duration(per_element),
+            "n", "padded", "stages", "comps", "Total", "/element"
         );
+        println!("{}", "-".repeat(58));
+
+        for r in results.iter().filter(|r| r.key_bits == key_bits) {
+            let per_element = r.shuffle_time / r.n as u32;
+            println!(
+                "{:>6} {:>8} {:>8} {:>6} {:>12} {:>12}",
+                r.n,
+                r.padded_n,
+                r.stages,
+                r.comparators,
+                format_duration(r.shuffle_time),
+                format_duration(per_element),
+            );
+        }
+        println!("{}", "-".repeat(58));
+        println!();
     }
-    println!("{}", "-".repeat(58));
 }

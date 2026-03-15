@@ -3,7 +3,7 @@
 /// A bitonic sorting network for n=2^k elements has k*(k+1)/2 stages,
 /// each with n/2 comparators. It sorts any input sequence.
 ///
-/// For n=16: 10 stages × 8 comparators = 80 comparisons, depth = 10.
+/// For n=16: 10 stages x 8 comparators = 80 comparisons, depth = 10.
 ///
 /// When used with random sort keys, it produces a uniformly random permutation
 /// (conditioned on no key collisions). For 64-bit keys and n=16, the collision
@@ -128,103 +128,6 @@ mod tests {
         assert_eq!(padded_size(17), 32);
     }
 
-    #[test]
-    fn test_padded_shuffle_is_permutation() {
-        // Simulate a non-power-of-2 shuffle: 10 elements padded to 16
-        let n = 10;
-        let padded_n = padded_size(n);
-        let network = bitonic_network(padded_n);
-
-        // Real keys are random, padding keys are u64::MAX
-        let mut keys: Vec<u64> = vec![9823, 1234, 5678, 42, 99999, 7, 7777, 3141, 2718, 65535];
-        keys.resize(padded_n, u64::MAX);
-
-        let mut data: Vec<u64> = (0..n as u64).collect();
-        data.resize(padded_n, u64::MAX); // padding data
-
-        let mut key_data: Vec<(u64, u64)> = keys.into_iter().zip(data.into_iter()).collect();
-
-        for stage in &network {
-            for &(i, j, ascending) in stage {
-                let should_swap = if ascending {
-                    key_data[i].0 > key_data[j].0
-                } else {
-                    key_data[i].0 < key_data[j].0
-                };
-                if should_swap {
-                    key_data.swap(i, j);
-                }
-            }
-        }
-
-        // First n elements should be a permutation of 0..n
-        let result: Vec<u64> = key_data[..n].iter().map(|&(_, v)| v).collect();
-        let mut sorted = result.clone();
-        sorted.sort();
-        assert_eq!(sorted, (0..n as u64).collect::<Vec<u64>>());
-
-        // Last (padded_n - n) elements should be padding
-        for i in n..padded_n {
-            assert_eq!(key_data[i].1, u64::MAX);
-        }
-    }
-
-    #[test]
-    fn test_bitonic_sorts_correctly() {
-        let network = bitonic_network(16);
-        let mut data: Vec<u64> = vec![15, 3, 7, 11, 0, 14, 2, 10, 8, 4, 12, 1, 6, 13, 9, 5];
-
-        for stage in &network {
-            for &(i, j, ascending) in stage {
-                if ascending {
-                    if data[i] > data[j] {
-                        data.swap(i, j);
-                    }
-                } else {
-                    if data[i] < data[j] {
-                        data.swap(i, j);
-                    }
-                }
-            }
-        }
-
-        assert_eq!(data, (0..16).collect::<Vec<u64>>());
-    }
-
-    #[test]
-    fn test_bitonic_shuffle_is_permutation() {
-        // Simulate a shuffle: assign random keys and sort by them
-        let network = bitonic_network(16);
-        let keys: Vec<u64> = vec![
-            9823, 1234, 5678, 42, 99999, 0, 7777, 3141,
-            2718, 65535, 11111, 8080, 404, 12345, 6789, 55555,
-        ];
-        let mut data: Vec<u64> = (0..16).collect();
-
-        // Sort data by keys using bitonic network
-        let mut key_data: Vec<(u64, u64)> = keys.iter().copied().zip(data.iter().copied()).collect();
-
-        for stage in &network {
-            for &(i, j, ascending) in stage {
-                let should_swap = if ascending {
-                    key_data[i].0 > key_data[j].0
-                } else {
-                    key_data[i].0 < key_data[j].0
-                };
-                if should_swap {
-                    key_data.swap(i, j);
-                }
-            }
-        }
-
-        data = key_data.iter().map(|&(_, v)| v).collect();
-
-        // Must be a valid permutation of 0..16
-        let mut sorted = data.clone();
-        sorted.sort();
-        assert_eq!(sorted, (0..16).collect::<Vec<u64>>());
-    }
-
     /// Helper: run a plaintext bitonic sort on the given data.
     fn plaintext_bitonic_sort(data: &mut [u64]) {
         let n = data.len();
@@ -261,6 +164,13 @@ mod tests {
     }
 
     #[test]
+    fn test_bitonic_sorts_correctly() {
+        let mut data: Vec<u64> = vec![15, 3, 7, 11, 0, 14, 2, 10, 8, 4, 12, 1, 6, 13, 9, 5];
+        plaintext_bitonic_sort(&mut data);
+        assert_eq!(data, (0..16).collect::<Vec<u64>>());
+    }
+
+    #[test]
     fn test_bitonic_sorts_8_elements() {
         let mut data: Vec<u64> = vec![7, 2, 5, 0, 3, 6, 1, 4];
         plaintext_bitonic_sort(&mut data);
@@ -289,14 +199,44 @@ mod tests {
     }
 
     #[test]
+    fn test_bitonic_shuffle_is_permutation() {
+        let keys: Vec<u64> = vec![
+            9823, 1234, 5678, 42, 99999, 0, 7777, 3141,
+            2718, 65535, 11111, 8080, 404, 12345, 6789, 55555,
+        ];
+        let mut data: Vec<u64> = (0..16).collect();
+        plaintext_shuffle(&mut data, &keys);
+
+        let mut sorted = data.clone();
+        sorted.sort();
+        assert_eq!(sorted, (0..16).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn test_shuffle_8_elements_is_permutation() {
+        let keys: Vec<u64> = vec![800, 100, 500, 300, 700, 200, 600, 400];
+        let mut data: Vec<u64> = (0..8).collect();
+        plaintext_shuffle(&mut data, &keys);
+        let mut sorted = data.clone();
+        sorted.sort();
+        assert_eq!(sorted, (0..8).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn test_shuffle_32_elements_is_permutation() {
+        let keys: Vec<u64> = (0..32).rev().collect();
+        let mut data: Vec<u64> = (0..32).collect();
+        plaintext_shuffle(&mut data, &keys);
+        let mut sorted = data.clone();
+        sorted.sort();
+        assert_eq!(sorted, (0..32).collect::<Vec<u64>>());
+    }
+
+    #[test]
     fn test_all_permutations_reachable_n4() {
-        // For n=4, there are 4! = 24 permutations. Verify that all 24 are
-        // reachable by sorting with distinct keys.
         use std::collections::HashSet;
 
         let mut seen = HashSet::new();
-
-        // Try all 24 orderings of 4 distinct keys
         let base_keys: Vec<u64> = vec![10, 20, 30, 40];
         let perms: Vec<Vec<usize>> = vec![
             vec![0,1,2,3], vec![0,1,3,2], vec![0,2,1,3], vec![0,2,3,1],
@@ -318,23 +258,42 @@ mod tests {
     }
 
     #[test]
-    fn test_shuffle_8_elements_is_permutation() {
-        let keys: Vec<u64> = vec![800, 100, 500, 300, 700, 200, 600, 400];
-        let mut data: Vec<u64> = (0..8).collect();
-        plaintext_shuffle(&mut data, &keys);
-        let mut sorted = data.clone();
-        sorted.sort();
-        assert_eq!(sorted, (0..8).collect::<Vec<u64>>());
-    }
+    fn test_padded_shuffle_is_permutation() {
+        // Simulate a non-power-of-2 shuffle: 10 elements padded to 16
+        let n = 10;
+        let padded_n = padded_size(n);
+        let network = bitonic_network(padded_n);
 
-    #[test]
-    fn test_shuffle_32_elements_is_permutation() {
-        // Use reversed indices as keys to get a deterministic but non-trivial permutation
-        let keys: Vec<u64> = (0..32).rev().collect();
-        let mut data: Vec<u64> = (0..32).collect();
-        plaintext_shuffle(&mut data, &keys);
-        let mut sorted = data.clone();
+        let mut keys: Vec<u64> = vec![9823, 1234, 5678, 42, 99999, 7, 7777, 3141, 2718, 65535];
+        keys.resize(padded_n, u64::MAX);
+
+        let mut data: Vec<u64> = (0..n as u64).collect();
+        data.resize(padded_n, u64::MAX);
+
+        let mut key_data: Vec<(u64, u64)> = keys.into_iter().zip(data.into_iter()).collect();
+
+        for stage in &network {
+            for &(i, j, ascending) in stage {
+                let should_swap = if ascending {
+                    key_data[i].0 > key_data[j].0
+                } else {
+                    key_data[i].0 < key_data[j].0
+                };
+                if should_swap {
+                    key_data.swap(i, j);
+                }
+            }
+        }
+
+        // First n elements should be a permutation of 0..n
+        let result: Vec<u64> = key_data[..n].iter().map(|&(_, v)| v).collect();
+        let mut sorted = result.clone();
         sorted.sort();
-        assert_eq!(sorted, (0..32).collect::<Vec<u64>>());
+        assert_eq!(sorted, (0..n as u64).collect::<Vec<u64>>());
+
+        // Last (padded_n - n) elements should be padding
+        for i in n..padded_n {
+            assert_eq!(key_data[i].1, u64::MAX);
+        }
     }
 }

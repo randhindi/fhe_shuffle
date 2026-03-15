@@ -53,20 +53,7 @@ trait SortKey: Sized + Send + Sync {
 // Macro implementations
 // ---------------------------------------------------------------------------
 
-macro_rules! impl_shuffleable_uint {
-    ($fhe_type:ty, $clear_type:ty) => {
-        impl Shuffleable for $fhe_type {
-            fn trivial_zero() -> Self {
-                <$fhe_type>::encrypt_trivial(0 as $clear_type)
-            }
-            fn conditional_swap(cond: &FheBool, a: &Self, b: &Self) -> (Self, Self) {
-                cond.flip(a, b)
-            }
-        }
-    };
-}
-
-macro_rules! impl_shuffleable_int {
+macro_rules! impl_shuffleable {
     ($fhe_type:ty, $clear_type:ty) => {
         impl Shuffleable for $fhe_type {
             fn trivial_zero() -> Self {
@@ -102,18 +89,18 @@ macro_rules! impl_sort_key {
 }
 
 // Shuffleable: unsigned integer types
-impl_shuffleable_uint!(FheUint8, u8);
-impl_shuffleable_uint!(FheUint16, u16);
-impl_shuffleable_uint!(FheUint32, u32);
-impl_shuffleable_uint!(FheUint64, u64);
-impl_shuffleable_uint!(FheUint128, u128);
+impl_shuffleable!(FheUint8, u8);
+impl_shuffleable!(FheUint16, u16);
+impl_shuffleable!(FheUint32, u32);
+impl_shuffleable!(FheUint64, u64);
+impl_shuffleable!(FheUint128, u128);
 
 // Shuffleable: signed integer types
-impl_shuffleable_int!(FheInt8, i8);
-impl_shuffleable_int!(FheInt16, i16);
-impl_shuffleable_int!(FheInt32, i32);
-impl_shuffleable_int!(FheInt64, i64);
-impl_shuffleable_int!(FheInt128, i128);
+impl_shuffleable!(FheInt8, i8);
+impl_shuffleable!(FheInt16, i16);
+impl_shuffleable!(FheInt32, i32);
+impl_shuffleable!(FheInt64, i64);
+impl_shuffleable!(FheInt128, i128);
 
 // SortKey: unsigned integer types only (keys must be unsigned for uniform distribution)
 impl_sort_key!(FheUint8, u8);
@@ -138,6 +125,13 @@ impl_sort_key!(FheUint128, u128);
 /// * `key_precision` - Bit-width of random sort keys: 8, 16, 32, 64, or 128.
 ///   Higher precision = lower collision probability but slower comparisons.
 ///   Use 64 for a good balance (collision bound < 2^-57 for n <= 16).
+///
+/// # Non-power-of-2 sizes
+///
+/// Input lengths that are not a power of 2 are automatically padded to the
+/// next power of 2 internally. Padding elements participate in all stages
+/// of the bitonic network, so **n=17 costs the same as n=32**. Choose
+/// power-of-2 sizes when possible for best efficiency.
 ///
 /// # Panics
 ///
@@ -185,14 +179,16 @@ fn shuffle_with_keys<D: Shuffleable, K: SortKey>(data: Vec<D>) -> Vec<D> {
     let padded_n = padded_size(n);
     let network = bitonic_network(padded_n);
 
-    // Generate n random sort keys via OPRF
+    // Generate n random sort keys via OPRF (parallelized)
+    use rand::Rng;
     let mut rng = rand::thread_rng();
-    let sort_keys: Vec<K> = (0..n)
-        .map(|_| {
-            use rand::Rng;
-            K::generate_random(Seed(rng.gen::<u128>()))
-        })
+    let seeds: Vec<Seed> = (0..n).map(|_| Seed(rng.gen::<u128>())).collect();
+    let oprf_start = std::time::Instant::now();
+    let sort_keys: Vec<K> = seeds
+        .into_par_iter()
+        .map(K::generate_random)
         .collect();
+    eprintln!("  OPRF ({} keys): {:?}", n, oprf_start.elapsed());
 
     // Initialize working arrays with Option for take/put pattern
     let mut data: Vec<Option<D>> = data.into_iter().map(Some).collect();
@@ -205,7 +201,8 @@ fn shuffle_with_keys<D: Shuffleable, K: SortKey>(data: Vec<D>) -> Vec<D> {
     }
 
     // Execute bitonic sorting network
-    for stage in &network {
+    for (stage_num, stage) in network.iter().enumerate() {
+        let stage_start = std::time::Instant::now();
         let pairs: Vec<_> = stage
             .iter()
             .map(|&(i, j, ascending)| {
@@ -241,6 +238,12 @@ fn shuffle_with_keys<D: Shuffleable, K: SortKey>(data: Vec<D>) -> Vec<D> {
             data[i] = Some(new_di);
             data[j] = Some(new_dj);
         }
+        eprintln!(
+            "  Stage {}/{}: {:?}",
+            stage_num + 1,
+            network.len(),
+            stage_start.elapsed()
+        );
     }
 
     // Return first n elements, discard padding
@@ -254,16 +257,31 @@ fn shuffle_with_keys<D: Shuffleable, K: SortKey>(data: Vec<D>) -> Vec<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
     use tfhe::{set_server_key, ConfigBuilder, ClientKey, ServerKey};
 
-    fn setup_keys() -> (ClientKey, ServerKey) {
-        let config = ConfigBuilder::default().build();
-        tfhe::generate_keys(config)
-    }
+    /// Shared key pair for all tests. Generates keys once, but sets the
+    /// thread-local server key on every calling thread (needed because
+    /// test threads run in parallel and each needs its own copy).
+    fn shared_keys() -> &'static (ClientKey, ServerKey) {
+        static KEYS: OnceLock<(ClientKey, ServerKey)> = OnceLock::new();
+        static RAYON_INIT: OnceLock<()> = OnceLock::new();
 
-    fn setup_server_key(server_key: ServerKey) {
-        set_server_key(server_key.clone());
-        rayon::broadcast(|_| set_server_key(server_key.clone()));
+        let keys = KEYS.get_or_init(|| {
+            let config = ConfigBuilder::default().build();
+            tfhe::generate_keys(config)
+        });
+
+        // Set server key on this test thread (thread-local)
+        set_server_key(keys.1.clone());
+
+        // Set on rayon workers (only once)
+        RAYON_INIT.get_or_init(|| {
+            let sk = keys.1.clone();
+            rayon::broadcast(move |_| set_server_key(sk.clone()));
+        });
+
+        keys
     }
 
     fn verify_permutation<T: FheDecrypt<u64>>(
@@ -285,16 +303,15 @@ mod tests {
 
     #[test]
     fn test_shuffle_2_elements_uint8() {
-        let (client_key, server_key) = setup_keys();
-        setup_server_key(server_key);
+        let (client_key, _) = shared_keys();
 
         let values: Vec<FheUint8> = (0..2u8)
-            .map(|i| FheUint8::encrypt(i, &client_key))
+            .map(|i| FheUint8::encrypt(i, client_key))
             .collect();
 
         let result = oblivious_shuffle(values, 8);
 
-        let decrypted: Vec<u8> = result.iter().map(|v| v.decrypt(&client_key)).collect();
+        let decrypted: Vec<u8> = result.iter().map(|v| v.decrypt(client_key)).collect();
         assert_eq!(decrypted.len(), 2);
         let mut sorted = decrypted.clone();
         sorted.sort();
@@ -303,55 +320,51 @@ mod tests {
 
     #[test]
     fn test_shuffle_2_elements_key_precision_16() {
-        let (client_key, server_key) = setup_keys();
-        setup_server_key(server_key);
+        let (client_key, _) = shared_keys();
 
         let values: Vec<FheUint64> = (0..2u64)
-            .map(|i| FheUint64::encrypt(i, &client_key))
+            .map(|i| FheUint64::encrypt(i, client_key))
             .collect();
 
         let result = oblivious_shuffle(values, 16);
-        verify_permutation(&result, 2, &client_key);
+        verify_permutation(&result, 2, client_key);
     }
 
     #[test]
     fn test_shuffle_2_elements_key_precision_32() {
-        let (client_key, server_key) = setup_keys();
-        setup_server_key(server_key);
+        let (client_key, _) = shared_keys();
 
         let values: Vec<FheUint64> = (0..2u64)
-            .map(|i| FheUint64::encrypt(i, &client_key))
+            .map(|i| FheUint64::encrypt(i, client_key))
             .collect();
 
         let result = oblivious_shuffle(values, 32);
-        verify_permutation(&result, 2, &client_key);
+        verify_permutation(&result, 2, client_key);
     }
 
     #[test]
     fn test_shuffle_2_elements_key_precision_64() {
-        let (client_key, server_key) = setup_keys();
-        setup_server_key(server_key);
+        let (client_key, _) = shared_keys();
 
         let values: Vec<FheUint64> = (0..2u64)
-            .map(|i| FheUint64::encrypt(i, &client_key))
+            .map(|i| FheUint64::encrypt(i, client_key))
             .collect();
 
         let result = oblivious_shuffle(values, 64);
-        verify_permutation(&result, 2, &client_key);
+        verify_permutation(&result, 2, client_key);
     }
 
     #[test]
     fn test_shuffle_uint16_data() {
-        let (client_key, server_key) = setup_keys();
-        setup_server_key(server_key);
+        let (client_key, _) = shared_keys();
 
         let values: Vec<FheUint16> = (0..2u16)
-            .map(|i| FheUint16::encrypt(i, &client_key))
+            .map(|i| FheUint16::encrypt(i, client_key))
             .collect();
 
         let result = oblivious_shuffle(values, 8);
 
-        let decrypted: Vec<u16> = result.iter().map(|v| v.decrypt(&client_key)).collect();
+        let decrypted: Vec<u16> = result.iter().map(|v| v.decrypt(client_key)).collect();
         assert_eq!(decrypted.len(), 2);
         let mut sorted = decrypted.clone();
         sorted.sort();
@@ -360,16 +373,15 @@ mod tests {
 
     #[test]
     fn test_shuffle_int32_data() {
-        let (client_key, server_key) = setup_keys();
-        setup_server_key(server_key);
+        let (client_key, _) = shared_keys();
 
         let values: Vec<FheInt32> = (0..2i32)
-            .map(|i| FheInt32::encrypt(i, &client_key))
+            .map(|i| FheInt32::encrypt(i, client_key))
             .collect();
 
         let result = oblivious_shuffle(values, 8);
 
-        let decrypted: Vec<i32> = result.iter().map(|v| v.decrypt(&client_key)).collect();
+        let decrypted: Vec<i32> = result.iter().map(|v| v.decrypt(client_key)).collect();
         assert_eq!(decrypted.len(), 2);
         let mut sorted = decrypted.clone();
         sorted.sort();
@@ -377,31 +389,105 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // ~30s — run with: cargo test -- --ignored
     fn test_shuffle_4_elements() {
-        let (client_key, server_key) = setup_keys();
-        setup_server_key(server_key);
+        let (client_key, _) = shared_keys();
 
         let values: Vec<FheUint64> = (0..4u64)
-            .map(|i| FheUint64::encrypt(i, &client_key))
+            .map(|i| FheUint64::encrypt(i, client_key))
             .collect();
 
         let result = oblivious_shuffle(values, 64);
-        verify_permutation(&result, 4, &client_key);
+        verify_permutation(&result, 4, client_key);
     }
 
     #[test]
-    #[ignore] // ~30s — run with: cargo test -- --ignored
+    fn test_shuffle_2_elements_key_precision_128() {
+        let (client_key, _) = shared_keys();
+
+        let values: Vec<FheUint64> = (0..2u64)
+            .map(|i| FheUint64::encrypt(i, client_key))
+            .collect();
+
+        let result = oblivious_shuffle(values, 128);
+        verify_permutation(&result, 2, client_key);
+    }
+
+    #[test]
+    fn test_shuffle_uint32_data() {
+        let (client_key, _) = shared_keys();
+        let values: Vec<FheUint32> = (0..2u32)
+            .map(|i| FheUint32::encrypt(i, client_key))
+            .collect();
+        let result = oblivious_shuffle(values, 8);
+        let decrypted: Vec<u32> = result.iter().map(|v| v.decrypt(client_key)).collect();
+        let mut sorted = decrypted.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![0u32, 1u32]);
+    }
+
+    #[test]
+    fn test_shuffle_uint128_data() {
+        let (client_key, _) = shared_keys();
+        let values: Vec<FheUint128> = (0..2u128)
+            .map(|i| FheUint128::encrypt(i, client_key))
+            .collect();
+        let result = oblivious_shuffle(values, 8);
+        let decrypted: Vec<u128> = result.iter().map(|v| v.decrypt(client_key)).collect();
+        let mut sorted = decrypted.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![0u128, 1u128]);
+    }
+
+    #[test]
+    fn test_shuffle_int8_data() {
+        let (client_key, _) = shared_keys();
+        let values: Vec<FheInt8> = (0..2i8)
+            .map(|i| FheInt8::encrypt(i, client_key))
+            .collect();
+        let result = oblivious_shuffle(values, 8);
+        let decrypted: Vec<i8> = result.iter().map(|v| v.decrypt(client_key)).collect();
+        let mut sorted = decrypted.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![0i8, 1i8]);
+    }
+
+    #[test]
+    fn test_shuffle_int64_data() {
+        let (client_key, _) = shared_keys();
+        let values: Vec<FheInt64> = (0..2i64)
+            .map(|i| FheInt64::encrypt(i, client_key))
+            .collect();
+        let result = oblivious_shuffle(values, 8);
+        let decrypted: Vec<i64> = result.iter().map(|v| v.decrypt(client_key)).collect();
+        let mut sorted = decrypted.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![0i64, 1i64]);
+    }
+
+    #[test]
+    fn test_shuffle_int128_data() {
+        let (client_key, _) = shared_keys();
+        let values: Vec<FheInt128> = (0..2i128)
+            .map(|i| FheInt128::encrypt(i, client_key))
+            .collect();
+        let result = oblivious_shuffle(values, 8);
+        let decrypted: Vec<i128> = result.iter().map(|v| v.decrypt(client_key)).collect();
+        let mut sorted = decrypted.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![0i128, 1i128]);
+    }
+
+    #[test]
+    #[ignore] // ~30s -- run with: cargo test -- --ignored
     fn test_shuffle_non_power_of_2() {
-        let (client_key, server_key) = setup_keys();
-        setup_server_key(server_key);
+        let (client_key, _) = shared_keys();
 
         let values: Vec<FheUint64> = (0..3u64)
-            .map(|i| FheUint64::encrypt(i, &client_key))
+            .map(|i| FheUint64::encrypt(i, client_key))
             .collect();
 
         let result = oblivious_shuffle(values, 64);
-        verify_permutation(&result, 3, &client_key);
+        verify_permutation(&result, 3, client_key);
     }
 
     #[test]
@@ -414,20 +500,17 @@ mod tests {
     #[test]
     #[should_panic(expected = "Need at least 2 elements")]
     fn test_shuffle_panics_on_single() {
-        let config = ConfigBuilder::default().build();
-        let (client_key, _) = tfhe::generate_keys(config);
-        let data = vec![FheUint64::encrypt(0u64, &client_key)];
+        let (client_key, _) = shared_keys();
+        let data = vec![FheUint64::encrypt(0u64, client_key)];
         oblivious_shuffle(data, 64);
     }
 
     #[test]
     #[should_panic(expected = "Unsupported key_precision")]
     fn test_shuffle_panics_on_invalid_precision() {
-        let config = ConfigBuilder::default().build();
-        let (client_key, server_key) = tfhe::generate_keys(config);
-        setup_server_key(server_key);
+        let (client_key, _) = shared_keys();
         let data: Vec<FheUint64> = (0..2u64)
-            .map(|i| FheUint64::encrypt(i, &client_key))
+            .map(|i| FheUint64::encrypt(i, client_key))
             .collect();
         oblivious_shuffle(data, 48);
     }
