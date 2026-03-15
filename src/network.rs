@@ -38,9 +38,13 @@ pub fn bitonic_network(n: usize) -> Vec<Vec<(usize, usize, bool)>> {
 }
 
 /// Count total comparators in a bitonic network of size n.
+///
+/// Formula: (n/2) * k * (k+1) / 2 where k = log2(n).
+/// Each of k*(k+1)/2 stages has n/2 comparators.
 pub fn bitonic_comparator_count(n: usize) -> usize {
-    let network = bitonic_network(n);
-    network.iter().map(|stage| stage.len()).sum()
+    assert!(n.is_power_of_two() && n >= 2);
+    let k = n.trailing_zeros() as usize;
+    (n / 2) * k * (k + 1) / 2
 }
 
 /// Returns the next power of 2 >= n (or n itself if already a power of 2).

@@ -183,12 +183,10 @@ fn shuffle_with_keys<D: Shuffleable, K: SortKey>(data: Vec<D>) -> Vec<D> {
     use rand::Rng;
     let mut rng = rand::thread_rng();
     let seeds: Vec<Seed> = (0..n).map(|_| Seed(rng.gen::<u128>())).collect();
-    let oprf_start = std::time::Instant::now();
     let sort_keys: Vec<K> = seeds
         .into_par_iter()
         .map(K::generate_random)
         .collect();
-    eprintln!("  OPRF ({} keys): {:?}", n, oprf_start.elapsed());
 
     // Initialize working arrays with Option for take/put pattern
     let mut data: Vec<Option<D>> = data.into_iter().map(Some).collect();
@@ -201,8 +199,7 @@ fn shuffle_with_keys<D: Shuffleable, K: SortKey>(data: Vec<D>) -> Vec<D> {
     }
 
     // Execute bitonic sorting network
-    for (stage_num, stage) in network.iter().enumerate() {
-        let stage_start = std::time::Instant::now();
+    for stage in &network {
         let pairs: Vec<_> = stage
             .iter()
             .map(|&(i, j, ascending)| {
@@ -238,12 +235,6 @@ fn shuffle_with_keys<D: Shuffleable, K: SortKey>(data: Vec<D>) -> Vec<D> {
             data[i] = Some(new_di);
             data[j] = Some(new_dj);
         }
-        eprintln!(
-            "  Stage {}/{}: {:?}",
-            stage_num + 1,
-            network.len(),
-            stage_start.elapsed()
-        );
     }
 
     // Return first n elements, discard padding
@@ -301,180 +292,78 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_shuffle_2_elements_uint8() {
-        let (client_key, _) = shared_keys();
-
-        let values: Vec<FheUint8> = (0..2u8)
-            .map(|i| FheUint8::encrypt(i, client_key))
-            .collect();
-
-        let result = oblivious_shuffle(values, 8);
-
-        let decrypted: Vec<u8> = result.iter().map(|v| v.decrypt(client_key)).collect();
-        assert_eq!(decrypted.len(), 2);
-        let mut sorted = decrypted.clone();
-        sorted.sort();
-        assert_eq!(sorted, vec![0u8, 1u8]);
+    /// Generates a type-coverage test: encrypt 2 elements, shuffle, verify permutation.
+    macro_rules! test_shuffle_type {
+        ($name:ident, $fhe_type:ty, $clear_type:ty) => {
+            #[test]
+            fn $name() {
+                let (client_key, _) = shared_keys();
+                let values: Vec<$fhe_type> = (0..2 as $clear_type)
+                    .map(|i| <$fhe_type>::encrypt(i, client_key))
+                    .collect();
+                let result = oblivious_shuffle(values, 8);
+                let decrypted: Vec<$clear_type> =
+                    result.iter().map(|v| v.decrypt(client_key)).collect();
+                let mut sorted = decrypted.clone();
+                sorted.sort();
+                assert_eq!(sorted, vec![0 as $clear_type, 1 as $clear_type]);
+            }
+        };
     }
 
-    #[test]
-    fn test_shuffle_2_elements_key_precision_16() {
-        let (client_key, _) = shared_keys();
+    // Unsigned types
+    test_shuffle_type!(test_shuffle_uint8, FheUint8, u8);
+    test_shuffle_type!(test_shuffle_uint16, FheUint16, u16);
+    test_shuffle_type!(test_shuffle_uint32, FheUint32, u32);
+    test_shuffle_type!(test_shuffle_uint64, FheUint64, u64);
+    test_shuffle_type!(test_shuffle_uint128, FheUint128, u128);
 
-        let values: Vec<FheUint64> = (0..2u64)
-            .map(|i| FheUint64::encrypt(i, client_key))
-            .collect();
+    // Signed types
+    test_shuffle_type!(test_shuffle_int8, FheInt8, i8);
+    test_shuffle_type!(test_shuffle_int16, FheInt16, i16);
+    test_shuffle_type!(test_shuffle_int32, FheInt32, i32);
+    test_shuffle_type!(test_shuffle_int64, FheInt64, i64);
+    test_shuffle_type!(test_shuffle_int128, FheInt128, i128);
 
-        let result = oblivious_shuffle(values, 16);
-        verify_permutation(&result, 2, client_key);
+    // Key precision coverage (all use FheUint64 data, vary the sort key width)
+    macro_rules! test_key_precision {
+        ($name:ident, $precision:expr) => {
+            #[test]
+            fn $name() {
+                let (client_key, _) = shared_keys();
+                let values: Vec<FheUint64> = (0..2u64)
+                    .map(|i| FheUint64::encrypt(i, client_key))
+                    .collect();
+                let result = oblivious_shuffle(values, $precision);
+                verify_permutation(&result, 2, client_key);
+            }
+        };
     }
 
-    #[test]
-    fn test_shuffle_2_elements_key_precision_32() {
-        let (client_key, _) = shared_keys();
-
-        let values: Vec<FheUint64> = (0..2u64)
-            .map(|i| FheUint64::encrypt(i, client_key))
-            .collect();
-
-        let result = oblivious_shuffle(values, 32);
-        verify_permutation(&result, 2, client_key);
-    }
-
-    #[test]
-    fn test_shuffle_2_elements_key_precision_64() {
-        let (client_key, _) = shared_keys();
-
-        let values: Vec<FheUint64> = (0..2u64)
-            .map(|i| FheUint64::encrypt(i, client_key))
-            .collect();
-
-        let result = oblivious_shuffle(values, 64);
-        verify_permutation(&result, 2, client_key);
-    }
-
-    #[test]
-    fn test_shuffle_uint16_data() {
-        let (client_key, _) = shared_keys();
-
-        let values: Vec<FheUint16> = (0..2u16)
-            .map(|i| FheUint16::encrypt(i, client_key))
-            .collect();
-
-        let result = oblivious_shuffle(values, 8);
-
-        let decrypted: Vec<u16> = result.iter().map(|v| v.decrypt(client_key)).collect();
-        assert_eq!(decrypted.len(), 2);
-        let mut sorted = decrypted.clone();
-        sorted.sort();
-        assert_eq!(sorted, vec![0u16, 1u16]);
-    }
-
-    #[test]
-    fn test_shuffle_int32_data() {
-        let (client_key, _) = shared_keys();
-
-        let values: Vec<FheInt32> = (0..2i32)
-            .map(|i| FheInt32::encrypt(i, client_key))
-            .collect();
-
-        let result = oblivious_shuffle(values, 8);
-
-        let decrypted: Vec<i32> = result.iter().map(|v| v.decrypt(client_key)).collect();
-        assert_eq!(decrypted.len(), 2);
-        let mut sorted = decrypted.clone();
-        sorted.sort();
-        assert_eq!(sorted, vec![0i32, 1i32]);
-    }
+    test_key_precision!(test_key_precision_16, 16);
+    test_key_precision!(test_key_precision_32, 32);
+    test_key_precision!(test_key_precision_64, 64);
+    test_key_precision!(test_key_precision_128, 128);
 
     #[test]
     fn test_shuffle_4_elements() {
         let (client_key, _) = shared_keys();
-
         let values: Vec<FheUint64> = (0..4u64)
             .map(|i| FheUint64::encrypt(i, client_key))
             .collect();
-
         let result = oblivious_shuffle(values, 64);
         verify_permutation(&result, 4, client_key);
     }
 
     #[test]
-    fn test_shuffle_2_elements_key_precision_128() {
+    #[ignore] // ~25s -- run with: cargo test -- --ignored
+    fn test_shuffle_8_elements() {
         let (client_key, _) = shared_keys();
-
-        let values: Vec<FheUint64> = (0..2u64)
+        let values: Vec<FheUint64> = (0..8u64)
             .map(|i| FheUint64::encrypt(i, client_key))
             .collect();
-
-        let result = oblivious_shuffle(values, 128);
-        verify_permutation(&result, 2, client_key);
-    }
-
-    #[test]
-    fn test_shuffle_uint32_data() {
-        let (client_key, _) = shared_keys();
-        let values: Vec<FheUint32> = (0..2u32)
-            .map(|i| FheUint32::encrypt(i, client_key))
-            .collect();
-        let result = oblivious_shuffle(values, 8);
-        let decrypted: Vec<u32> = result.iter().map(|v| v.decrypt(client_key)).collect();
-        let mut sorted = decrypted.clone();
-        sorted.sort();
-        assert_eq!(sorted, vec![0u32, 1u32]);
-    }
-
-    #[test]
-    fn test_shuffle_uint128_data() {
-        let (client_key, _) = shared_keys();
-        let values: Vec<FheUint128> = (0..2u128)
-            .map(|i| FheUint128::encrypt(i, client_key))
-            .collect();
-        let result = oblivious_shuffle(values, 8);
-        let decrypted: Vec<u128> = result.iter().map(|v| v.decrypt(client_key)).collect();
-        let mut sorted = decrypted.clone();
-        sorted.sort();
-        assert_eq!(sorted, vec![0u128, 1u128]);
-    }
-
-    #[test]
-    fn test_shuffle_int8_data() {
-        let (client_key, _) = shared_keys();
-        let values: Vec<FheInt8> = (0..2i8)
-            .map(|i| FheInt8::encrypt(i, client_key))
-            .collect();
-        let result = oblivious_shuffle(values, 8);
-        let decrypted: Vec<i8> = result.iter().map(|v| v.decrypt(client_key)).collect();
-        let mut sorted = decrypted.clone();
-        sorted.sort();
-        assert_eq!(sorted, vec![0i8, 1i8]);
-    }
-
-    #[test]
-    fn test_shuffle_int64_data() {
-        let (client_key, _) = shared_keys();
-        let values: Vec<FheInt64> = (0..2i64)
-            .map(|i| FheInt64::encrypt(i, client_key))
-            .collect();
-        let result = oblivious_shuffle(values, 8);
-        let decrypted: Vec<i64> = result.iter().map(|v| v.decrypt(client_key)).collect();
-        let mut sorted = decrypted.clone();
-        sorted.sort();
-        assert_eq!(sorted, vec![0i64, 1i64]);
-    }
-
-    #[test]
-    fn test_shuffle_int128_data() {
-        let (client_key, _) = shared_keys();
-        let values: Vec<FheInt128> = (0..2i128)
-            .map(|i| FheInt128::encrypt(i, client_key))
-            .collect();
-        let result = oblivious_shuffle(values, 8);
-        let decrypted: Vec<i128> = result.iter().map(|v| v.decrypt(client_key)).collect();
-        let mut sorted = decrypted.clone();
-        sorted.sort();
-        assert_eq!(sorted, vec![0i128, 1i128]);
+        let result = oblivious_shuffle(values, 16);
+        verify_permutation(&result, 8, client_key);
     }
 
     #[test]

@@ -1,6 +1,38 @@
 # FHE Shuffle
 
-Oblivious permutation of encrypted data using [TFHE-rs](https://github.com/zama-ai/tfhe-rs). Shuffles `n` `FheUint64` ciphertexts into a uniformly random permutation — without the server ever learning the permutation applied. Supports any `n >= 2` (non-power-of-2 sizes are handled automatically via padding).
+Oblivious permutation of encrypted data using [TFHE-rs](https://github.com/zama-ai/tfhe-rs). Shuffles `n` encrypted ciphertexts into a uniformly random permutation — without the server ever learning the permutation applied. Works with all TFHE-rs encrypted integer types (`FheUint8` through `FheUint128`, `FheInt8` through `FheInt128`). Supports any `n >= 2` (non-power-of-2 sizes are handled automatically via padding).
+
+## Quick Start
+
+```rust
+use tfhe::{prelude::*, set_server_key, ConfigBuilder, FheUint64};
+use fhe_shuffle::oblivious_shuffle;
+
+let config = ConfigBuilder::default().build();
+let (client_key, server_key) = tfhe::generate_keys(config);
+set_server_key(server_key);
+
+let values: Vec<FheUint64> = (0..16u64)
+    .map(|i| FheUint64::encrypt(i, &client_key))
+    .collect();
+
+// Shuffle with 32-bit sort keys (collision probability < 2^-25 for n=16)
+let shuffled = oblivious_shuffle(values, 32);
+```
+
+## Key Precision
+
+The `key_precision` parameter controls the bit-width of the random sort keys used internally. Higher precision = lower collision probability but slower comparisons:
+
+| key_precision | Key type    | Collision bound (n=16) | Relative speed |
+|---------------|-------------|------------------------|----------------|
+| 8             | FheUint8    | ~2^-1 (NOT recommended)| ~4x faster     |
+| 16            | FheUint16   | ~2^-9                  | ~2x faster     |
+| 32            | FheUint32   | ~2^-25                 | baseline       |
+| 64            | FheUint64   | < 2^-57                | ~1x (same)     |
+| 128           | FheUint128  | < 2^-121               | slower         |
+
+**Recommendation:** Use **32-bit keys** for most applications. Negligible bias for N ≤ 10,000 with ~2x speedup over 64-bit. Use 16-bit keys only if N ≤ 32 and performance is critical.
 
 ## Algorithm
 
@@ -8,14 +40,14 @@ The core idea: **reduce shuffling to sorting by random keys**. If you assign eac
 
 ### Step 1 — Generate Oblivious Random Sort Keys
 
-The server generates `n` encrypted random `FheUint64` values using TFHE's oblivious pseudo-random function (OPRF):
+The server generates `n` encrypted random values using TFHE's oblivious pseudo-random function (OPRF):
 
 ```
 for i in 0..n:
-    sort_keys[i] = FheUint64::generate_oblivious_pseudo_random(Seed(random_u128))
+    sort_keys[i] = FheUintXX::generate_oblivious_pseudo_random(Seed(random_u128))
 ```
 
-Each seed is a public random `u128`, but the OPRF evaluates a PRF under the FHE secret key — the resulting ciphertext encrypts a pseudorandom 64-bit value that **nobody knows** (not the server, not the client) until the client decrypts. This is what makes the shuffle oblivious: the server cannot learn which permutation was applied.
+Each seed is a public random `u128`, but the OPRF evaluates a PRF under the FHE secret key — the resulting ciphertext encrypts a pseudorandom value that **nobody knows** (not the server, not the client) until the client decrypts. This is what makes the shuffle oblivious: the server cannot learn which permutation was applied.
 
 ### Step 2 — Pair Keys with Data
 
@@ -33,12 +65,10 @@ We sort the `n` pairs by their encrypted keys using a **bitonic sorting network*
 
 The bitonic network requires a power-of-2 input size. When `n` is not a power of 2, the shuffle automatically pads to the next power of 2:
 
-- **Padding sort keys**: Trivially encrypted `u64::MAX` values. Since the bitonic network sorts in ascending order, these maximum keys are guaranteed to sort to the end of the array.
+- **Padding sort keys**: Trivially encrypted maximum values. Since the bitonic network sorts in ascending order, these maximum keys are guaranteed to sort to the end of the array.
 - **Padding data**: Trivially encrypted zeros (value is irrelevant — padding is discarded after sorting).
 
-After sorting, only the first `n` positions are returned. The real elements occupy these positions (sorted by their random OPRF keys = uniform permutation), while padding sits at the end.
-
-For example, shuffling 10 elements uses a 16-element bitonic network (10 stages), with 6 padding slots. The cost is the same as shuffling 16 elements — the overhead comes from rounding up to the next power of 2.
+After sorting, only the first `n` positions are returned. **n=17 costs the same as n=32** — choose power-of-2 sizes when possible.
 
 #### What is a Bitonic Network?
 
@@ -87,9 +117,9 @@ cmp = key[i].gt(&key[j])       // or .lt() depending on direction
 (new_data[i], new_data[j]) = cmp.flip(data[i], data[j])  // swap data if cmp is true
 ```
 
-The `gt` comparison is the most expensive operation. Each `FheUint64` consists of 32 blocks of 2 encrypted bits each, and comparing two values requires a chain of programmable bootstrapping (PBS) operations across all 32 blocks.
+The `gt` comparison is the most expensive operation — it requires a chain of programmable bootstrapping (PBS) operations across all blocks.
 
-The `flip` operator (introduced in TFHE-rs v1.4.1) performs a conditional swap of two encrypted values in a single operation: `flip(true, a, b) = (b, a)` and `flip(false, a, b) = (a, b)`. The two `flip` calls (keys and data) are independent and run in parallel via `rayon::join`.
+The `flip` operator performs a conditional swap of two encrypted values: `flip(true, a, b) = (b, a)` and `flip(false, a, b) = (a, b)`. The two `flip` calls (keys and data) are independent and run in parallel via `rayon::join`.
 
 ### Step 4 — Extract Shuffled Data
 
@@ -103,11 +133,11 @@ result = [pairs[0].data, pairs[1].data, ..., pairs[n-1].data]
 
 The algorithm maximizes parallelism at two levels:
 
-1. **Inter-comparator** (stage-level): All 8 comparators in each stage operate on disjoint pairs and execute in parallel via `rayon::par_iter()`.
+1. **Inter-comparator** (stage-level): All comparators in each stage operate on disjoint pairs and execute in parallel via `rayon::par_iter()`.
 
 2. **Intra-comparator**: Within each comparator, the 2 `flip` calls (keys and data) are independent and run concurrently via `rayon::join()`.
 
-The overall depth is **10 sequential stages**. The width is **8 parallel comparators × 2 parallel flips = 16-way parallelism** within each stage (plus the `gt` comparison which must complete first).
+The overall depth is the number of sequential stages. The width is `n/2` parallel comparators per stage.
 
 ### Why Not Benes Network?
 
@@ -119,49 +149,36 @@ The bitonic sort approach avoids this entirely. With distinct sort keys, each of
 
 ## Uniformity Analysis
 
-The shuffle is a **uniformly random permutation** conditioned on all 16 sort keys being distinct.
+The shuffle is a **uniformly random permutation** conditioned on all sort keys being distinct.
 
-**Collision probability** (birthday bound):
+**Collision probability** (birthday bound) for n elements with k-bit keys:
 
 ```
-P(at least one collision) = 1 - Product(i=0..15) of (2^64 - i) / 2^64
-                          ≤ C(16, 2) / 2^64
-                          = 120 / 2^64
-                          ≈ 6.5 × 10^-18
-                          < 2^-57
+P(at least one collision) ≈ n² / (2 × 2^k)
 ```
 
-This means:
-- **Statistical distance from uniform**: `< 2^-57`
-- **Bias per permutation**: for any specific permutation π, `|Pr[output = π] - 1/16!| < 2^-57 / 16!`
-- This is well within the `< 2^-40` security bound
+| n | 16-bit keys | 32-bit keys | 64-bit keys |
+|---|-------------|-------------|-------------|
+| 8 | 0.04% | ~0% | ~0% |
+| 16 | 0.2% | ~0% | ~0% |
+| 32 | 0.8% | ~0% | ~0% |
+| 256 | **39%** | 0.0008% | ~0% |
+| 1024 | **~100%** | 0.012% | ~0% |
+| 65536 | broken | **39%** | ~0% |
 
-In practice, you would need to run the shuffle roughly `2^57` times before expecting a single key collision. Even in the (astronomically unlikely) event of a collision, the output is still a valid permutation of the input — just not drawn from the perfectly uniform distribution.
+Even in the (astronomically unlikely) event of a collision, the output is still a valid permutation — just not drawn from the perfectly uniform distribution.
 
-### FHE Operations Per Shuffle
+### Scaling
 
-For `n=16`:
-
-| Operation | Count | Notes |
-|-----------|-------|-------|
-| OPRF (key generation) | 16 | One `FheUint64` per element |
-| `gt` / `lt` comparisons | 80 | 10 stages × 8 comparators |
-| `flip` (conditional swap) | 160 | 80 comparators × 2 each (keys + data) |
-
-### Scaling to Other Sizes
-
-| n | Padded to | Stages | Comparators | `gt` | `flip` | Collision bound |
-|---|-----------|--------|-------------|------|--------|-----------------|
-| 4 | 4 | 3 | 6 | 6 | 12 | < 2^-61 |
-| 8 | 8 | 6 | 24 | 24 | 48 | < 2^-59 |
-| 10 | 16 | 10 | 80 | 80 | 160 | < 2^-58 |
-| 16 | 16 | 10 | 80 | 80 | 160 | < 2^-57 |
-| 20 | 32 | 15 | 240 | 240 | 480 | < 2^-56 |
-| 32 | 32 | 15 | 240 | 240 | 480 | < 2^-55 |
-| 52 | 64 | 21 | 672 | 672 | 1344 | < 2^-54 |
-| 64 | 64 | 21 | 672 | 672 | 1344 | < 2^-53 |
-
-Non-power-of-2 sizes are padded to the next power of 2, so `n=10` has the same cost as `n=16`. The collision bound degrades gracefully: even at `n=1024`, `P(collision) < 2^-44`, still well within `2^-40`.
+| n | Padded to | Stages | Comparators | Collision bound (32-bit) |
+|---|-----------|--------|-------------|--------------------------|
+| 4 | 4 | 3 | 6 | ~0% |
+| 8 | 8 | 6 | 24 | ~0% |
+| 16 | 16 | 10 | 80 | ~0% |
+| 32 | 32 | 15 | 240 | ~0% |
+| 64 | 64 | 21 | 672 | ~0% |
+| 128 | 128 | 28 | 1792 | 0.0002% |
+| 256 | 256 | 36 | 4608 | 0.0008% |
 
 ## Running Benchmarks
 
@@ -188,7 +205,8 @@ cargo run --release --features gpu
 
 ```bash
 source environment/dev.env
-cargo test --release
+cargo test --release                  # fast tests (~20s)
+cargo test --release -- --ignored     # includes slow n=8 and n=3 tests
 ```
 
 The `environment/dev.env` file sets `RUSTFLAGS="-C target-cpu=native"` to enable AVX2/AVX-512 optimizations on the host CPU.
@@ -202,15 +220,16 @@ fhe_shuffle/
 │   └── dev.env             # RUSTFLAGS for native CPU features
 ├── README.md
 └── src/
-    ├── main.rs             # Benchmark runner (CPU + GPU)
+    ├── lib.rs              # Library root: re-exports oblivious_shuffle + Shuffleable
+    ├── shuffle.rs          # Generic shuffle: traits, impls, oblivious_shuffle()
     ├── network.rs          # Bitonic sorting network topology
-    └── shuffle.rs          # FHE shuffle using bitonic sort
+    └── main.rs             # Multi-precision benchmark runner (CPU + GPU)
 ```
 
 ## Dependencies
 
 | Crate | Version | Purpose |
 |-------|---------|---------|
-| `tfhe` | 1.5.3 | FHE operations (`FheUint64`, OPRF, `flip`, `gt`) |
+| `tfhe` | 1.5.3 | FHE operations (OPRF, `flip`, `gt`, encrypted integers) |
 | `rayon` | 1.10 | Parallel comparators within each stage |
 | `rand` | 0.8 | Seeds for OPRF generation |
