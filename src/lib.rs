@@ -40,5 +40,7 @@
 
 pub mod network;
 pub mod shuffle;
+pub mod waksman;
 
 pub use shuffle::{oblivious_shuffle, Shuffleable};
+pub use waksman::waksman_shuffle;
